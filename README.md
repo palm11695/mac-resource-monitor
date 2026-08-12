@@ -38,8 +38,27 @@
 | `server.py` | dashboard server — refresh อัตโนมัติ เลือกช่วง/interval ได้ |
 | `report.py` | สร้างรายงาน static `report.html` (server ใช้ renderer ตัวเดียวกันนี้) |
 | `install.sh` / `uninstall.sh` | ติดตั้ง/ถอน LaunchAgents |
-| `logs/sys-YYYY-MM-DD.csv` | ข้อมูลระดับเครื่อง: CPU%, load, RAM breakdown, swap |
+| `logs/sys-YYYY-MM-DD.csv` | ข้อมูลระดับเครื่อง: CPU%, load, RAM breakdown, swap, swap/compressor I/O rate |
 | `logs/proc-YYYY-MM-DD.csv` | top 5 process ตาม CPU และตาม RAM ต่อ tick |
+
+### คอลัมน์ใน `sys-*.csv`
+
+| คอลัมน์ | ความหมาย |
+|---|---|
+| `cpu_pct` | % ของ CPU ทั้งเครื่อง คิดจาก cputime delta (ดู "วิธีวัด") |
+| `mem_used_mb` | active + wired + compressor (= "Memory Used" ใน Activity Monitor) |
+| `mem_compressed_mb` | ขนาดที่ compressor กินอยู่ — **ตัวชี้ memory pressure ที่ไวที่สุด** |
+| `mem_wired_mb` / `mem_free_mb` | wired (ย้ายไม่ได้) / free + inactive + speculative |
+| `swap_used_mb` | ขนาด swap ที่ถูกใช้ (ระดับ ไม่ใช่อัตรา) |
+| `swapin_mbs` / `swapout_mbs` | **อัตรา** อ่าน/เขียน swap MB/s ในช่วง tick นั้น |
+| `compress_mbs` / `decompress_mbs` | อัตราบีบอัด/คลายบีบ MB/s |
+
+คู่ `swapin/swapout` กับ `compress/decompress` คือตัวแยกระหว่าง "swap สูงแต่จอดนิ่ง"
+(ไม่กระทบความเร็ว) กับ "กำลัง thrash" (กิน CPU + เขียน SSD ตลอด) — ดูจากระดับ
+`swap_used_mb` อย่างเดียวแยกสองกรณีนี้ไม่ได้
+
+ถ้า schema เปลี่ยนในอนาคต ไฟล์เดิมของวันนั้นจะถูกเปลี่ยนชื่อเป็น `.vN.csv`
+แทนการเขียนต่อท้ายแบบคอลัมน์เหลื่อม — report ยังอ่านไฟล์เก่าได้ตามปกติ
 
 ## Dashboard สด
 

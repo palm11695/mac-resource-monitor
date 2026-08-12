@@ -38,6 +38,10 @@ ICONS = {
              'a2.5 2.5 0 0 0 2.5 2.5z"/>',
     "database": '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/>'
                 '<path d="M3 12A9 3 0 0 0 21 12"/>',
+    "archive": '<rect width="20" height="5" x="2" y="3" rx="1"/>'
+               '<path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
+    "upload": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>'
+              '<polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
     "refresh": '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>'
                '<path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
     "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/>'
@@ -72,7 +76,7 @@ STYLE = """
   --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
   --tint: rgba(11,11,11,0.045); --glass: rgba(249,249,247,0.82);
-  --s1: #2a78d6; --s2: #eb6834;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -81,7 +85,7 @@ STYLE = """
     --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
     --tint: rgba(255,255,255,0.06); --glass: rgba(13,13,13,0.78);
-    --s1: #3987e5; --s2: #d95926;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
   }
 }
 :root[data-theme="dark"] {
@@ -90,7 +94,7 @@ STYLE = """
   --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
   --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
   --tint: rgba(255,255,255,0.06); --glass: rgba(13,13,13,0.78);
-  --s1: #3987e5; --s2: #d95926;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
 }
 #themeToggle .icon-sun { display: none; }
 #themeToggle .icon-moon { display: block; }
@@ -280,6 +284,14 @@ function bindCharts() {
 """
 
 
+def num(v):
+    """CSV cell -> float, or None when the column is absent/blank."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def load_sys(days):
     rows = []
     cutoff = datetime.now() - timedelta(days=days)
@@ -290,12 +302,18 @@ def load_sys(days):
                     ts = datetime.strptime(r["timestamp"], "%Y-%m-%dT%H:%M:%S")
                     if ts < cutoff:
                         continue
+                    # swap I/O columns were added later — rows logged before
+                    # that carry None so the chart breaks instead of drawing
+                    # a fabricated zero line.
                     rows.append({
                         "ts": ts,
                         "cpu": float(r["cpu_pct"]),
                         "mem": float(r["mem_used_mb"]),
+                        "comp": float(r.get("mem_compressed_mb") or 0),
                         "swap": float(r["swap_used_mb"]),
                         "load1": float(r["load_1m"]),
+                        "swapin": num(r.get("swapin_mbs")),
+                        "swapout": num(r.get("swapout_mbs")),
                     })
                 except (ValueError, KeyError):
                     continue
@@ -337,7 +355,9 @@ def percentile(vals, p):
 
 
 def bucket(rows, key, n=400):
-    """Downsample to <= n points; each bucket is (mid timestamp, mean value)."""
+    """Downsample to <= n points; each bucket is (mid timestamp, mean value).
+    Rows whose value is None (column not logged yet) are skipped."""
+    rows = [r for r in rows if r.get(key) is not None]
     if len(rows) <= n:
         return [(r["ts"], r[key]) for r in rows]
     out = []
@@ -540,14 +560,27 @@ def render_body(days):
 
     cpu_vals = [r["cpu"] for r in rows]
     mem_vals = [r["mem"] for r in rows]
+    io_rows = [r for r in rows if r["swapout"] is not None]
     tiles = [
         ("cpu", "CPU เฉลี่ย", f"{sum(cpu_vals) / len(cpu_vals):.1f}%"),
         ("gauge", "CPU P95", f"{percentile(cpu_vals, 0.95):.1f}%"),
         ("zap", "CPU สูงสุด", f"{max(cpu_vals):.1f}%"),
         ("memory", "RAM เฉลี่ย", f"{sum(mem_vals) / len(mem_vals) / 1024:.1f} GB"),
-        ("memory", "RAM สูงสุด", f"{max(mem_vals) / 1024:.1f} GB"),
+        ("archive", "Compressor ล่าสุด", f"{rows[-1]['comp'] / 1024:.1f} GB"),
         ("harddrive", "Swap ล่าสุด", f"{rows[-1]['swap'] / 1024:.1f} GB"),
     ]
+    if io_rows:
+        # swap I/O started being logged later than the rest, so say so rather
+        # than letting an average over minutes look like one over the range
+        cov = ""
+        if len(io_rows) < 0.9 * len(rows):
+            secs = (io_rows[-1]["ts"] - io_rows[0]["ts"]).total_seconds()
+            cov = (f" ({secs / 3600:.0f} ชม.ล่าสุด)" if secs >= 3600
+                   else f" ({secs / 60:.0f} นาทีล่าสุด)")
+        tiles.append(("upload", f"Swap out เฉลี่ย{cov}",
+                      f"{sum(r['swapout'] for r in io_rows) / len(io_rows):.1f} MB/s"))
+        tiles.append(("flame", f"Swap out สูงสุด{cov}",
+                      f"{max(r['swapout'] for r in io_rows):.0f} MB/s"))
     tiles_html = "".join(
         f'<div class="tile"><div class="tico">{icon(ic, 18)}</div>'
         f'<div><div class="v">{v}</div><div class="l">{k}</div></div></div>'
@@ -560,8 +593,14 @@ def render_body(days):
     mem_chart = line_chart(
         "mem", "หน่วยความจำ (MB)",
         [{"name": "RAM ที่ใช้", "var": "s1", "points": bucket(rows, "mem")},
-         {"name": "Swap ที่ใช้", "var": "s2", "points": bucket(rows, "swap")}], " MB",
+         {"name": "ถูกบีบอัด", "var": "s2", "points": bucket(rows, "comp")},
+         {"name": "Swap ที่ใช้", "var": "s3", "points": bucket(rows, "swap")}], " MB",
         ic="memory")
+    io_chart = line_chart(
+        "swapio", "อัตราการอ่าน/เขียน swap (MB/s)",
+        [{"name": "Swap out", "var": "s2", "points": bucket(rows, "swapout")},
+         {"name": "Swap in", "var": "s1", "points": bucket(rows, "swapin")}], " MB/s",
+        ic="refresh") if io_rows else ""
 
     by_hour = {}
     for r in rows:
@@ -576,6 +615,7 @@ def render_body(days):
 <div class="tiles">{tiles_html}</div>
 {cpu_chart}
 {mem_chart}
+{io_chart}
 {hour_chart}
 <div class="grid2">
 {proc_table("โปรเซสกิน CPU สูงสุด", proc["cpu"], proc_totals.get("cpu", 0), "%CPU", ic="flame")}

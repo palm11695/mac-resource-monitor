@@ -29,8 +29,14 @@ PAGESIZE = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"]).strip())
 MB = 1048576
 
 SYS_HEADER = ["timestamp", "cpu_pct", "load_1m", "mem_used_mb", "mem_wired_mb",
-              "mem_compressed_mb", "mem_free_mb", "swap_used_mb"]
+              "mem_compressed_mb", "mem_free_mb", "swap_used_mb",
+              "swapin_mbs", "swapout_mbs", "compress_mbs", "decompress_mbs"]
 PROC_HEADER = ["timestamp", "metric", "rank", "value", "command"]
+
+# vm_stat cumulative page counters -> per-tick rates, in CSV column order
+RATE_COUNTERS = [("swapin_mbs", "Swapins"), ("swapout_mbs", "Swapouts"),
+                 ("compress_mbs", "Compressions"),
+                 ("decompress_mbs", "Decompressions")]
 
 
 def sh(args):
@@ -64,12 +70,27 @@ def read_procs():
     return procs
 
 
-def read_memory():
+def read_vm_pages():
+    """vm_stat as a dict of page counts (levels and cumulative counters)."""
     pages = {}
     for line in sh(["vm_stat"]).splitlines():
         m = re.match(r"(.+?):\s+(\d+)\.", line)
         if m:
             pages[m.group(1)] = int(m.group(2))
+    return pages
+
+
+def rates(pages, prev_pages, dt):
+    """Cumulative page counters -> MB/s over the interval.
+    Missing prev (first tick) or a counter reset (reboot) yields 0."""
+    out = []
+    for _, key in RATE_COUNTERS:
+        d = pages.get(key, 0) - prev_pages.get(key, 0) if prev_pages else 0
+        out.append(max(0.0, d) * PAGESIZE / MB / dt if dt > 0 else 0.0)
+    return out
+
+
+def read_memory(pages):
     used = (pages.get("Pages active", 0) + pages.get("Pages wired down", 0)
             + pages.get("Pages occupied by compressor", 0)) * PAGESIZE / MB
     wired = pages.get("Pages wired down", 0) * PAGESIZE / MB
@@ -82,6 +103,16 @@ def read_memory():
 
 
 def append(path, header, rows):
+    # If an existing file predates a schema change, set it aside under a
+    # versioned name rather than appending misaligned columns to it. Reports
+    # still read it — the glob picks up sys-*.csv either way.
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            if next(csv.reader(f), None) != header:
+                n = 1
+                while os.path.exists(f"{path[:-4]}.v{n}.csv"):
+                    n += 1
+                os.rename(path, f"{path[:-4]}.v{n}.csv")
     new = not os.path.exists(path)
     with open(path, "a", newline="") as f:
         w = csv.writer(f)
@@ -90,7 +121,7 @@ def append(path, header, rows):
         w.writerows(rows)
 
 
-def tick(prev, prev_t, procs, now):
+def tick(prev, prev_t, procs, now, pages, prev_pages):
     dt = now - prev_t
     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     day = datetime.now().strftime("%Y-%m-%d")
@@ -109,10 +140,12 @@ def tick(prev, prev_t, procs, now):
 
     cpu_pct = min(100.0, total / (dt * NCPU) * 100.0)
     load1 = sh(["sysctl", "-n", "vm.loadavg"]).split()[1]
-    used, wired, comp, free, swap_used = read_memory()
+    used, wired, comp, free, swap_used = read_memory(pages)
+    io = rates(pages, prev_pages, dt)
     append(os.path.join(LOG_DIR, f"sys-{day}.csv"), SYS_HEADER,
            [[ts, f"{cpu_pct:.1f}", load1, f"{used:.0f}", f"{wired:.0f}",
-             f"{comp:.0f}", f"{free:.0f}", f"{swap_used:.1f}"]])
+             f"{comp:.0f}", f"{free:.0f}", f"{swap_used:.1f}"]
+            + [f"{v:.2f}" for v in io]])
 
     top_cpu = sorted(by_cmd.items(), key=lambda kv: kv[1], reverse=True)[:5]
     rows = [[ts, "cpu", i + 1, f"{d / (dt * NCPU) * 100:.1f}", comm]
@@ -130,16 +163,17 @@ def tick(prev, prev_t, procs, now):
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
     print(f"resmon sampler started, interval={INTERVAL}s", flush=True)
-    prev, prev_t = None, None
+    prev, prev_t, prev_pages = None, None, None
     last_cleanup = 0.0
     while True:
         started = time.time()
         try:
             procs = read_procs()
+            pages = read_vm_pages()
             now = time.time()
             if prev is not None and now - prev_t <= INTERVAL * 3:
-                tick(prev, prev_t, procs, now)
-            prev, prev_t = procs, now
+                tick(prev, prev_t, procs, now, pages, prev_pages)
+            prev, prev_t, prev_pages = procs, now, pages
             if now - last_cleanup > 3600:
                 subprocess.run(["find", LOG_DIR, "-name", "*.csv",
                                 "-mtime", f"+{RETENTION_DAYS}", "-delete"], check=False)
