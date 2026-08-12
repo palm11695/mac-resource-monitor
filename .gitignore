@@ -1,0 +1,5 @@
+logs/
+report.html
+__pycache__/
+*.plist
+.DS_Store
